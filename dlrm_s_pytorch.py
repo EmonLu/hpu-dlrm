@@ -83,6 +83,11 @@ import sklearn.metrics
 import torch
 import torch.nn as nn
 
+# habana
+import habana_frameworks.torch
+import habana_frameworks.torch.hpu as hthpu
+import habana_frameworks.torch.core as htcore
+
 # dataloader
 try:
     from internals import fbDataLoader, fbInputBatchFormatter
@@ -120,15 +125,17 @@ with warnings.catch_warnings():
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 
 
-def time_wrap(use_gpu):
+def time_wrap(use_gpu, use_hpu):
     if use_gpu:
         torch.cuda.synchronize()
+    if use_hpu:
+        htcore.hpu.synchronize()
     return time.time()
 
 
-def dlrm_wrap(X, lS_o, lS_i, use_gpu, device, ndevices=1):
+def dlrm_wrap(X, lS_o, lS_i, use_gpu, use_hpu, device, ndevices=1):
     with record_function("DLRM forward"):
-        if use_gpu:  # .cuda()
+        if use_gpu or use_hpu:  
             # lS_i can be either a list of tensors or a stacked tensor.
             # Handle each case below:
             if ndevices == 1:
@@ -633,7 +640,10 @@ class DLRM_Net(nn.Module):
             t_list = []
             w_list = []
             for k, emb in enumerate(self.emb_l):
-                d = torch.device("cuda:" + str(k % ndevices))
+                if use_gpu:
+                    d = torch.device("cuda:" + str(k % ndevices))
+                elif use_hpu:
+                    d = torch.device("hpu:" + str(k % ndevices))
                 t_list.append(emb.to(d))
                 if self.weighted_pooling == "learned":
                     w_list.append(Parameter(self.v_W_l[k].to(d)))
@@ -764,6 +774,7 @@ def inference(
     test_ld,
     device,
     use_gpu,
+    use_hpu,
     log_iter=-1,
 ):
     test_accu = 0
@@ -793,14 +804,17 @@ def inference(
             lS_o_test,
             lS_i_test,
             use_gpu,
+            use_hpu,
             device,
             ndevices=ndevices,
         )
         ### gather the distributed results on each rank ###
         # For some reason it requires explicit sync before all_gather call if
         # tensor is on GPU memory
-        if Z_test.is_cuda:
+        if use_gpu and Z_test.is_cuda:
             torch.cuda.synchronize()
+        elif use_hpu and Z_test.device.type=='hpu':
+            htcore.hpu.synchronize()
         (_, batch_split_lengths) = ext_dist.get_split_lengths(X_test.size(0))
         if ext_dist.my_size > 1:
             Z_test = ext_dist.all_gather(Z_test, batch_split_lengths)
@@ -988,6 +1002,8 @@ def run():
     parser.add_argument("--save-onnx", action="store_true", default=False)
     # gpu
     parser.add_argument("--use-gpu", action="store_true", default=False)
+    # hpu
+    parser.add_argument("--use-hpu", action="store_true", default=False)
     # distributed
     parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--dist-backend", type=str, default="")
@@ -1055,6 +1071,9 @@ def run():
             )
         if args.use_gpu:
             sys.exit("ERROR: 4 and 8-bit quantization on GPU is not supported")
+        ## TODO maybe support?
+        if args.use_hpu:
+            sys.exit("ERROR: 4 and 8-bit quantization on HPU is not supported")
 
     ### some basic setup ###
     np.random.seed(args.numpy_rand_seed)
@@ -1070,10 +1089,11 @@ def run():
         args.test_num_workers = args.num_workers
 
     use_gpu = args.use_gpu and torch.cuda.is_available()
+    use_hpu = args.use_hpu and hthpu.is_available()
 
     if not args.debug_mode:
         ext_dist.init_distributed(
-            local_rank=args.local_rank, use_gpu=use_gpu, backend=args.dist_backend
+            local_rank=args.local_rank, use_gpu=use_gpu, use_hpu=use_hpu, backend=args.dist_backend
         )
 
     if use_gpu:
@@ -1086,6 +1106,16 @@ def run():
             ngpus = torch.cuda.device_count()
             device = torch.device("cuda", 0)
         print("Using {} GPU(s)...".format(ngpus))
+    elif use_hpu:
+        hthpu.manual_seed_all(args.numpy_rand_seed)
+        hthpu.setDeterministic(True)
+        if ext_dist.my_size > 1:
+            nhpus = 1
+            device = torch.device("hpu", ext_dist.my_local_rank)
+        else:
+            nhpus = hthpu.device_count()
+            device = torch.device("hpu")
+        print("Using {} HPU(s)...".format(nhpus))
     else:
         device = torch.device("cpu")
         print("Using CPU...")
@@ -1276,6 +1306,7 @@ def run():
 
     global ndevices
     ndevices = min(ngpus, args.mini_batch_size, num_fea - 1) if use_gpu else -1
+    ndevices = min(nhpus, args.mini_batch_size, num_fea - 1) if use_hpu else -1
 
     ### construct the neural network specified above ###
     # WARNING: to obtain exactly the same initialization for
@@ -1324,10 +1355,25 @@ def run():
             if dlrm.weighted_pooling == "fixed":
                 for k, w in enumerate(dlrm.v_W_l):
                     dlrm.v_W_l[k] = w.cuda()
+    elif use_hpu:
+        # Custom Model-Data Parallel
+        # the mlps are replicated and use data parallelism, while
+        # the embeddings are distributed and use model parallelism
+        print(device)
+        print(dlrm)
+        dlrm = dlrm.to(device)  
+        if dlrm.ndevices > 1:
+            dlrm.emb_l, dlrm.v_W_l = dlrm.create_emb(
+                m_spa, ln_emb, args.weighted_pooling
+            )
+        else:
+            if dlrm.weighted_pooling == "fixed":
+                for k, w in enumerate(dlrm.v_W_l):
+                    dlrm.v_W_l[k] = w.to('hpu')
 
     # distribute data parallel mlps
     if ext_dist.my_size > 1:
-        if use_gpu:
+        if use_gpu or use_hpu:
             device_ids = [ext_dist.my_local_rank]
             dlrm.bot_l = ext_dist.DDP(dlrm.bot_l, device_ids=device_ids)
             dlrm.top_l = ext_dist.DDP(dlrm.top_l, device_ids=device_ids)
@@ -1411,6 +1457,14 @@ def run():
                     args.load_model,
                     map_location=torch.device("cuda"),
                     # map_location=lambda storage, loc: storage.cuda(0)
+                )
+        elif use_hpu:
+            if dlrm.ndevices > 1:
+                ld_model = torch.load(args.load_model, map_location=device)
+            else:
+                ld_model = torch.load(
+                    args.load_model,
+                    map_location=torch.device("hpu"),
                 )
         else:
             # when targeting inference on CPU
@@ -1548,14 +1602,14 @@ def run():
                     X, lS_o, lS_i, T, W, CBPP = unpack_batch(inputBatch)
 
                     if args.mlperf_logging:
-                        current_time = time_wrap(use_gpu)
+                        current_time = time_wrap(use_gpu, use_hpu)
                         if previous_iteration_time:
                             iteration_time = current_time - previous_iteration_time
                         else:
                             iteration_time = 0
                         previous_iteration_time = current_time
                     else:
-                        t1 = time_wrap(use_gpu)
+                        t1 = time_wrap(use_gpu, use_hpu)
 
                     # early exit if nbatches was set by the user and has been exceeded
                     if nbatches > 0 and j >= nbatches:
@@ -1577,6 +1631,7 @@ def run():
                         lS_o,
                         lS_i,
                         use_gpu,
+                        use_hpu,
                         device,
                         ndevices=ndevices,
                     )
@@ -1623,7 +1678,7 @@ def run():
                     if args.mlperf_logging:
                         total_time += iteration_time
                     else:
-                        t2 = time_wrap(use_gpu)
+                        t2 = time_wrap(use_gpu, use_hpu)
                         total_time += t2 - t1
 
                     total_loss += L * mbs
@@ -1696,6 +1751,7 @@ def run():
                             test_ld,
                             device,
                             use_gpu,
+                            use_hpu,
                             log_iter,
                         )
 
@@ -1789,6 +1845,7 @@ def run():
                 test_ld,
                 device,
                 use_gpu,
+                use_hpu
             )
 
     # profiling
@@ -1900,8 +1957,9 @@ def run():
         dlrm_pytorch_onnx = onnx.load("dlrm_s_pytorch.onnx")
         # check the onnx model
         onnx.checker.check_model(dlrm_pytorch_onnx)
-    total_time_end = time_wrap(use_gpu)
+    total_time_end = time_wrap(use_gpu, use_hpu)
 
 
 if __name__ == "__main__":
     run()
+

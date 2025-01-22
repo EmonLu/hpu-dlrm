@@ -62,7 +62,7 @@ def get_split_lengths(n):
     return (my_len, splits)
 
 
-def init_distributed(rank=-1, local_rank=-1, size=-1, use_gpu=False, backend=""):
+def init_distributed(rank=-1, local_rank=-1, size=-1, use_gpu=False, use_hpu=False, backend=""):
     global myreq
     global my_rank
     global my_size
@@ -75,7 +75,7 @@ def init_distributed(rank=-1, local_rank=-1, size=-1, use_gpu=False, backend="")
     num_mpi_ranks = env2int(
         ["PMI_SIZE", "OMPI_COMM_WORLD_SIZE", "MV2_COMM_WORLD_SIZE", "WORLD_SIZE"]
     )
-    if backend == "" and num_mpi_ranks > 1:
+    if backend == "" and num_mpi_ranks > 1 and not use_hpu:
         if torch_ccl and env2int(["CCL_WORKER_COUNT"]) > 0:
             backend = "ccl"
         elif use_gpu and dist.is_nccl_available():
@@ -87,6 +87,9 @@ def init_distributed(rank=-1, local_rank=-1, size=-1, use_gpu=False, backend="")
                 "WARNING: MPI multi-process launch detected but PyTorch MPI backend not available."
             )
             backend = "gloo"
+
+    if use_hpu:
+        backend = "hccl"
 
     if backend != "":
         # guess Rank and size
@@ -157,6 +160,20 @@ def init_distributed(rank=-1, local_rank=-1, size=-1, use_gpu=False, backend="")
                 )
                 sys.exit(1)
             torch.cuda.set_device(my_local_rank)
+        elif use_hpu:
+            if my_local_size > torch.hpu.device_count():
+                print(
+                    "Not sufficient HPUs available... local_size = %d, nhpus = %d"
+                    % (my_local_size, torch.hpu.device_count())
+                )
+                sys.exit(1)
+            torch.hpu.set_device(my_local_rank)
+            from habana_frameworks.torch.distributed.hccl import initialize_distributed_hpu
+
+            size, rank, local_rank = initialize_distributed_hpu()
+            print('| distributed init (rank {}) (world_size {})'.format(
+                global_rank, world_size), flush=True)
+
         dist.init_process_group(backend, rank=rank, world_size=size)
         my_rank = dist.get_rank()
         my_size = dist.get_world_size()
@@ -167,6 +184,8 @@ def init_distributed(rank=-1, local_rank=-1, size=-1, use_gpu=False, backend="")
                 t = torch.zeros([4])
                 if use_gpu:
                     t = t.cuda()
+                elif use_hpu:
+                    t = t.to('hpu')
                 dist.all_to_all_single(t, t)
                 alltoall_supported = True
             except RuntimeError as err:
@@ -602,3 +621,4 @@ builtins.print = rank0_print
 # Allow printing from all rank with explicit print_all
 def print_all(*args, **kwargs):
     orig_print(*args, **kwargs)
+
