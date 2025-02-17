@@ -61,7 +61,6 @@ import datetime
 import json
 import sys
 import time
-
 # onnx
 # The onnx import causes deprecation warnings every time workers
 # are spawned during testing. So, we filter out those warnings.
@@ -231,8 +230,8 @@ class DLRM_Net(nn.Module):
             std_dev = np.sqrt(1 / m)  # np.sqrt(2 / (m + 1))
             bt = np.random.normal(mean, std_dev, size=m).astype(np.float32)
             # approach 1
-            LL.weight.data = torch.tensor(W, requires_grad=True)
-            LL.bias.data = torch.tensor(bt, requires_grad=True)
+            LL.weight.data = torch.tensor(W, requires_grad=True).to(torch.bfloat16)
+            LL.bias.data = torch.tensor(bt, requires_grad=True).to(torch.bfloat16)
             # approach 2
             # LL.weight.data.copy_(torch.tensor(W))
             # LL.bias.data.copy_(torch.tensor(bt))
@@ -279,16 +278,16 @@ class DLRM_Net(nn.Module):
                 W = np.random.uniform(
                     low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, _m)
                 ).astype(np.float32)
-                EE.embs.weight.data = torch.tensor(W, requires_grad=True)
+                EE.embs.weight.data = torch.tensor(W, requires_grad=True).to(torch.bfloat16)
             else:
-                EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True)
+                EE = nn.EmbeddingBag(n, m, mode="sum", sparse=False)
                 # initialize embeddings
                 # nn.init.uniform_(EE.weight, a=-np.sqrt(1 / n), b=np.sqrt(1 / n))
                 W = np.random.uniform(
                     low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, m)
                 ).astype(np.float32)
                 # approach 1
-                EE.weight.data = torch.tensor(W, requires_grad=True)
+                EE.weight.data = torch.tensor(W, requires_grad=True).to(torch.bfloat16)
                 # approach 2
                 # EE.weight.data.copy_(torch.tensor(W))
                 # approach 3
@@ -296,7 +295,7 @@ class DLRM_Net(nn.Module):
             if weighted_pooling is None:
                 v_W_l.append(None)
             else:
-                v_W_l.append(torch.ones(n, dtype=torch.float32))
+                v_W_l.append(torch.ones(n, dtype=torch.float32)).to(torch.bfloat16)
             emb_l.append(EE)
         return emb_l, v_W_l
 
@@ -522,6 +521,7 @@ class DLRM_Net(nn.Module):
         return R
 
     def forward(self, dense_x, lS_o, lS_i):
+        dense_x = dense_x.to(torch.bfloat16)
         if ext_dist.my_size > 1:
             # multi-node multi-device run
             return self.distributed_forward(dense_x, lS_o, lS_i)
@@ -808,6 +808,8 @@ def inference(
             device,
             ndevices=ndevices,
         )
+        if args.lazy_mode:
+            htcore.mark_step()
         ### gather the distributed results on each rank ###
         # For some reason it requires explicit sync before all_gather call if
         # tensor is on GPU memory
@@ -827,7 +829,7 @@ def inference(
         else:
             with record_function("DLRM accuracy compute"):
                 # compute loss and accuracy
-                S_test = Z_test.detach().cpu().numpy()  # numpy array
+                S_test = Z_test.to(torch.float32).detach().cpu().numpy()  # numpy array
                 T_test = T_test.detach().cpu().numpy()  # numpy array
 
                 mbs_test = T_test.shape[0]  # = mini_batch_size except last
@@ -918,6 +920,7 @@ def run():
     parser = argparse.ArgumentParser(
         description="Train Deep Learning Recommendation Model (DLRM)"
     )
+    parser.add_argument("--lazy-mode", type=bool, default=False)
     # model related parameters
     parser.add_argument("--arch-sparse-feature-size", type=int, default=2)
     parser.add_argument(
@@ -1283,7 +1286,6 @@ def run():
         print("data (inputs and targets):")
         for j, inputBatch in enumerate(train_ld):
             X, lS_o, lS_i, T, W, CBPP = unpack_batch(inputBatch)
-
             torch.set_printoptions(precision=4)
             # early exit if nbatches was set by the user and has been exceeded
             if nbatches > 0 and j >= nbatches:
@@ -1359,8 +1361,6 @@ def run():
         # Custom Model-Data Parallel
         # the mlps are replicated and use data parallelism, while
         # the embeddings are distributed and use model parallelism
-        print(device)
-        print(dlrm)
         dlrm = dlrm.to(device)  
         if dlrm.ndevices > 1:
             dlrm.emb_l, dlrm.v_W_l = dlrm.create_emb(
@@ -1466,6 +1466,8 @@ def run():
                     args.load_model,
                     map_location=torch.device("hpu"),
                 )
+            if not args.lazy_mode:
+                ld_model = torch.compile(ld_model, backend = "hpu")
         else:
             # when targeting inference on CPU
             ld_model = torch.load(args.load_model, map_location=torch.device("cpu"))
@@ -1564,9 +1566,10 @@ def run():
     writer = SummaryWriter(tb_file)
 
     ext_dist.barrier()
-    with torch.autograd.profiler.profile(
-        args.enable_profiling, use_cuda=use_gpu, record_shapes=True
-    ) as prof:
+    #with torch.autograd.profiler.profile(
+    #    args.enable_profiling, use_cuda=use_gpu, record_shapes=True
+    #) as prof:
+    if use_hpu:
         if not args.inference_only:
             k = 0
             total_time_begin = 0
@@ -1600,7 +1603,6 @@ def run():
                         continue
 
                     X, lS_o, lS_i, T, W, CBPP = unpack_batch(inputBatch)
-
                     if args.mlperf_logging:
                         current_time = time_wrap(use_gpu, use_hpu)
                         if previous_iteration_time:
@@ -1635,7 +1637,6 @@ def run():
                         device,
                         ndevices=ndevices,
                     )
-
                     if ext_dist.my_size > 1:
                         T = T[ext_dist.get_my_slice(mbs)]
                         W = W[ext_dist.get_my_slice(mbs)]
@@ -1667,6 +1668,8 @@ def run():
                         # backward pass
                         E.backward()
 
+                        if args.lazy_mode:
+                            htcore.mark_step()
                         # optimizer
                         if (
                             args.mlperf_logging
@@ -1674,13 +1677,14 @@ def run():
                         ) or not args.mlperf_logging:
                             optimizer.step()
                             lr_scheduler.step()
+                            if args.lazy_mode:
+                                htcore.mark_step()
 
                     if args.mlperf_logging:
                         total_time += iteration_time
                     else:
                         t2 = time_wrap(use_gpu, use_hpu)
                         total_time += t2 - t1
-
                     total_loss += L * mbs
                     total_iter += 1
                     total_samp += mbs
