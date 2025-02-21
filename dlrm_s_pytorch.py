@@ -132,7 +132,7 @@ def time_wrap(use_gpu, use_hpu):
     return time.time()
 
 
-def dlrm_wrap(X, lS_o, lS_i, use_gpu, use_hpu, device, ndevices=1):
+def dlrm_wrap(X, lS_o, lS_i, use_gpu, use_hpu, device, ndevices=1, inference_only=0):
     with record_function("DLRM forward"):
         if use_gpu or use_hpu:  
             # lS_i can be either a list of tensors or a stacked tensor.
@@ -148,7 +148,19 @@ def dlrm_wrap(X, lS_o, lS_i, use_gpu, use_hpu, device, ndevices=1):
                     if isinstance(lS_o, list)
                     else lS_o.to(device)
                 )
-        return dlrm(X.to(device), lS_o, lS_i)
+                X = X.to(device)
+                if inference_only:
+                    print("Benchmarking with 1000 inferences:")
+                    print("X :", X.shape)
+                    print("lS_o: ", lS_o.shape)
+                    print("lS_i: ", len(lS_i), lS_i[0].shape)
+                    start_time = time.time()
+                    for i in range(1000):
+                        dlrm(X, lS_o, lS_i)
+                    end_time = time.time()
+                    execution_time = end_time - start_time
+                    print(f"1000 inference execution time: {execution_time} seconds")
+        return dlrm(X, lS_o, lS_i)
 
 
 def loss_fn_wrap(Z, T, use_gpu, device):
@@ -797,7 +809,7 @@ def inference(
         if ext_dist.my_size > 1 and X_test.size(0) % ext_dist.my_size != 0:
             print("Warning: Skiping the batch %d with size %d" % (i, X_test.size(0)))
             continue
-
+        print("Using HPU: ", use_hpu)
         # forward pass
         Z_test = dlrm_wrap(
             X_test,
@@ -807,7 +819,8 @@ def inference(
             use_hpu,
             device,
             ndevices=ndevices,
-        )
+            inference_only=args.inference_only)
+        break
         if args.lazy_mode:
             htcore.mark_step()
         ### gather the distributed results on each rank ###
@@ -869,16 +882,16 @@ def inference(
                 log_iter,
             )
         acc_test = validation_results["accuracy"]
-    else:
-        acc_test = test_accu / test_samp
-        writer.add_scalar("Test/Acc", acc_test, log_iter)
+    #else:
+        #acc_test = test_accu / test_samp
+        #writer.add_scalar("Test/Acc", acc_test, log_iter)
 
     model_metrics_dict = {
         "nepochs": args.nepochs,
         "nbatches": nbatches,
         "nbatches_test": nbatches_test,
         "state_dict": dlrm.state_dict(),
-        "test_acc": acc_test,
+        #"test_acc": acc_test,
     }
 
     if args.mlperf_logging:
@@ -903,15 +916,16 @@ def inference(
             flush=True,
         )
     else:
-        is_best = acc_test > best_acc_test
-        if is_best:
-            best_acc_test = acc_test
-        print(
-            " accuracy {:3.3f} %, best {:3.3f} %".format(
-                acc_test * 100, best_acc_test * 100
-            ),
-            flush=True,
-        )
+        #is_best = acc_test > best_acc_test
+        #if is_best:
+        #    best_acc_test = acc_test
+        #print(
+        #    " accuracy {:3.3f} %, best {:3.3f} %".format(
+        #        acc_test * 100, best_acc_test * 100
+        #    ),
+        #    flush=True,
+        #)
+        is_best = 0
     return model_metrics_dict, is_best
 
 
@@ -954,6 +968,7 @@ def run():
     # data
     parser.add_argument("--data-size", type=int, default=1)
     parser.add_argument("--num-batches", type=int, default=0)
+    parser.add_argument("--test-load-num-batches", type=int, default=1)
     parser.add_argument(
         "--data-generation",
         type=str,
@@ -1361,7 +1376,8 @@ def run():
         # Custom Model-Data Parallel
         # the mlps are replicated and use data parallelism, while
         # the embeddings are distributed and use model parallelism
-        dlrm = dlrm.to(device)  
+        print(device)
+        dlrm = dlrm.to(torch.device("hpu"))  
         if dlrm.ndevices > 1:
             dlrm.emb_l, dlrm.v_W_l = dlrm.create_emb(
                 m_spa, ln_emb, args.weighted_pooling
@@ -1569,7 +1585,13 @@ def run():
     #with torch.autograd.profiler.profile(
     #    args.enable_profiling, use_cuda=use_gpu, record_shapes=True
     #) as prof:
-    if use_hpu:
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    activities.append(torch.profiler.ProfilerActivity.HPU)
+    with torch.profiler.profile(
+        schedule=torch.profiler.schedule(wait=0, warmup=20, active=5, repeat=1),
+        activities=activities,
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('./profile_logs')) as prof:
+    #if use_hpu:
         if not args.inference_only:
             k = 0
             total_time_begin = 0
@@ -1636,6 +1658,7 @@ def run():
                         use_hpu,
                         device,
                         ndevices=ndevices,
+                        inference_only=args.inference_only
                     )
                     if ext_dist.my_size > 1:
                         T = T[ext_dist.get_my_slice(mbs)]

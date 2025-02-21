@@ -758,7 +758,7 @@ def make_random_data_and_loader(
 
     test_loader = torch.utils.data.DataLoader(
         test_data,
-        batch_size=1,
+        batch_size=args.test_load_num_batches,
         shuffle=False,
         num_workers=args.num_workers,
         collate_fn=collate_wrapper_random,
