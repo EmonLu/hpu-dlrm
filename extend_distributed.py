@@ -90,6 +90,7 @@ def init_distributed(rank=-1, local_rank=-1, size=-1, use_gpu=False, use_hpu=Fal
 
     if use_hpu:
         backend = "hccl"
+        print("Using backend HCCL!")
 
     if backend != "":
         # guess Rank and size

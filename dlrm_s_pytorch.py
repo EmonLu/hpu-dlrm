@@ -86,6 +86,7 @@ import torch.nn as nn
 import habana_frameworks.torch
 import habana_frameworks.torch.hpu as hthpu
 import habana_frameworks.torch.core as htcore
+from habana_frameworks.torch.hpu.metrics import metric_global
 
 # dataloader
 try:
@@ -123,6 +124,9 @@ with warnings.catch_warnings():
 
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 
+fallback_metric = metric_global("cpu_fallback")
+
+print(fallback_metric.stats())
 
 def time_wrap(use_gpu, use_hpu):
     if use_gpu:
@@ -133,33 +137,42 @@ def time_wrap(use_gpu, use_hpu):
 
 
 def dlrm_wrap(X, lS_o, lS_i, use_gpu, use_hpu, device, ndevices=1, inference_only=0):
+    print("dlrm_wrap --- device = ", device)
     with record_function("DLRM forward"):
         if use_gpu or use_hpu:  
             # lS_i can be either a list of tensors or a stacked tensor.
             # Handle each case below:
-            if ndevices == 1:
-                lS_i = (
-                    [S_i.to(device) for S_i in lS_i]
-                    if isinstance(lS_i, list)
-                    else lS_i.to(device)
-                )
-                lS_o = (
-                    [S_o.to(device) for S_o in lS_o]
-                    if isinstance(lS_o, list)
-                    else lS_o.to(device)
-                )
-                X = X.to(device)
-                if inference_only:
-                    print("Benchmarking with 1000 inferences:")
-                    print("X :", X.shape)
-                    print("lS_o: ", lS_o.shape)
-                    print("lS_i: ", len(lS_i), lS_i[0].shape)
-                    start_time = time.time()
-                    for i in range(1000):
-                        dlrm(X, lS_o, lS_i)
-                    end_time = time.time()
-                    execution_time = end_time - start_time
-                    print(f"1000 inference execution time: {execution_time} seconds")
+            # if ndevices == 1:
+            lS_i = (
+                [S_i.to(device) for S_i in lS_i]
+                if isinstance(lS_i, list)
+                else lS_i.to(device)
+            )
+            lS_o = (
+                [S_o.to(device) for S_o in lS_o]
+                if isinstance(lS_o, list)
+                else lS_o.to(device)
+            )
+            X = X.to(device)
+        if inference_only:
+            print("Benchmarking with 1000 inferences:")
+            print("Model input shape and device:")
+            print("X :", X.shape)
+            print("lS_o: ", lS_o.shape)
+            print("lS_i: ", len(lS_i), lS_i[0].shape)
+            print(X.device)
+            print(lS_i[0].device)
+            print(lS_o[0].device)
+            print(dlrm)
+            print("Model parameters are on : ")
+            for param in dlrm.parameters():
+                print(param.device)
+            start_time = time.time()
+            for i in range(1000):
+                dlrm(X, lS_o, lS_i)
+            end_time = time.time()
+            execution_time = end_time - start_time
+            print(f"1000 inference execution time: {execution_time} seconds")
         return dlrm(X, lS_o, lS_i)
 
 
@@ -473,7 +486,10 @@ class DLRM_Net(nn.Module):
                     sparse_offset_group_batch,
                     per_sample_weights=per_sample_weights,
                 )
-
+                # print("EmbeddingBag output is on ", V.device)
+                if args.use_hpu:
+                    V = V.to("hpu")
+                # print("V", V.device)
                 ly.append(V)
 
         # print(ly)
@@ -499,6 +515,8 @@ class DLRM_Net(nn.Module):
         self.quantize_bits = bits
 
     def interact_features(self, x, ly):
+        # print("x", x.device)
+        # print("ly", ly[0].device)
         if self.arch_interaction_op == "dot":
             # concatenate dense and sparse features
             (batch_size, d) = x.shape
@@ -533,6 +551,7 @@ class DLRM_Net(nn.Module):
         return R
 
     def forward(self, dense_x, lS_o, lS_i):
+        # if args.single_device: self.ndevices = 1
         dense_x = dense_x.to(torch.bfloat16)
         if ext_dist.my_size > 1:
             # multi-node multi-device run
@@ -1025,6 +1044,7 @@ def run():
     # distributed
     parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--dist-backend", type=str, default="")
+    parser.add_argument("--single-device", action="store_true", default=False)
     # debugging and profiling
     parser.add_argument("--print-freq", type=int, default=1)
     parser.add_argument("--test-freq", type=int, default=-1)
@@ -1133,7 +1153,7 @@ def run():
         else:
             nhpus = hthpu.device_count()
             device = torch.device("hpu")
-        print("Using {} HPU(s)...".format(nhpus))
+        print("Detect {} HPU(s)...".format(nhpus))
     else:
         device = torch.device("cpu")
         print("Using CPU...")
@@ -1324,6 +1344,7 @@ def run():
     global ndevices
     ndevices = min(ngpus, args.mini_batch_size, num_fea - 1) if use_gpu else -1
     ndevices = min(nhpus, args.mini_batch_size, num_fea - 1) if use_hpu else -1
+    if args.single_device: ndevices = 1
 
     ### construct the neural network specified above ###
     # WARNING: to obtain exactly the same initialization for
@@ -1376,8 +1397,8 @@ def run():
         # Custom Model-Data Parallel
         # the mlps are replicated and use data parallelism, while
         # the embeddings are distributed and use model parallelism
-        print(device)
-        dlrm = dlrm.to(torch.device("hpu"))  
+        print("Moving dlrm to : ", device)
+        dlrm = dlrm.to(device)  
         if dlrm.ndevices > 1:
             dlrm.emb_l, dlrm.v_W_l = dlrm.create_emb(
                 m_spa, ln_emb, args.weighted_pooling
@@ -1582,15 +1603,15 @@ def run():
     writer = SummaryWriter(tb_file)
 
     ext_dist.barrier()
-    #with torch.autograd.profiler.profile(
-    #    args.enable_profiling, use_cuda=use_gpu, record_shapes=True
-    #) as prof:
-    activities = [torch.profiler.ProfilerActivity.CPU]
-    activities.append(torch.profiler.ProfilerActivity.HPU)
-    with torch.profiler.profile(
-        schedule=torch.profiler.schedule(wait=0, warmup=20, active=5, repeat=1),
-        activities=activities,
-        on_trace_ready=torch.profiler.tensorboard_trace_handler('./profile_logs')) as prof:
+    with torch.autograd.profiler.profile(
+       args.enable_profiling, record_shapes=True
+    ) as prof:
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        activities.append(torch.profiler.ProfilerActivity.HPU)
+    # with torch.profiler.profile(
+    #     schedule=torch.profiler.schedule(wait=0, warmup=20, active=5, repeat=1),
+    #     activities=activities,
+    #     on_trace_ready=torch.profiler.tensorboard_trace_handler('./profile_logs')) as prof:
     #if use_hpu:
         if not args.inference_only:
             k = 0
@@ -1989,4 +2010,4 @@ def run():
 
 if __name__ == "__main__":
     run()
-
+    print(fallback_metric.stats())
